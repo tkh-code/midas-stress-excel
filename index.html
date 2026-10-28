@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>midas 応力抽出 Excel</title>
+<style>
+:root{--green:#14805d;--deep:#0c6247;--line:#e5ebe8;--muted:#71807b;font-family:"Noto Sans JP","Yu Gothic UI",sans-serif;color:#24302e;background:#f5f7f6}
+*{box-sizing:border-box}body{margin:0}
+header{background:#fff;border-bottom:1px solid #e9eeeb;padding:0 max(20px,calc((100vw - 880px)/2));height:56px;display:flex;align-items:center;gap:10px;font-weight:700}
+header .mark{width:28px;height:28px;border-radius:8px;background:#e4f3ed;color:var(--green);display:grid;place-items:center}
+header small{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted)}
+main{max-width:880px;margin:0 auto;padding:28px 20px 48px}
+h1{font-size:24px;margin:0 0 6px}p.lead{color:var(--muted);font-size:13px;margin:0 0 22px;line-height:1.7}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
+.drops{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.drop{border:1px dashed #cdd9d4;border-radius:10px;padding:18px;cursor:pointer;display:block;background:#fcfdfc}
+.drop:hover,.drop.on{border-color:#5caf8b;background:#f7fcf9}
+.drop b{display:block;font-size:13px}.drop span{display:block;font-size:11px;color:var(--muted);margin-top:3px}
+.drop .name{margin-top:10px;font-size:12px;color:#3f7a62;word-break:break-all}
+input[type=file]{display:none}
+.opts{display:flex;gap:18px;flex-wrap:wrap;margin-top:16px;font-size:12px;color:#53615c;align-items:center}
+.opts input{width:80px;padding:6px;border:1px solid #d8e2dd;border-radius:6px;font:inherit}
+button{border:0;border-radius:8px;background:var(--green);color:#fff;font:inherit;font-weight:700;padding:12px 22px;cursor:pointer}
+button:disabled{background:#b7c9c1;cursor:default}button:hover:not(:disabled){background:var(--deep)}
+#status{font-size:12px;color:var(--muted);margin:14px 0 8px;display:flex;gap:8px;align-items:center}
+#status i{width:8px;height:8px;border-radius:50%;background:#32a579;display:inline-block}#status.err i{background:#d97a60}#status.err{color:#b4533a}
+#log{background:#fafbfa;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:11px/1.7 ui-monospace,Consolas,monospace;color:#53615c;height:150px;overflow:auto;white-space:pre-wrap}
+table{border-collapse:collapse;font-size:12px;width:100%}td,th{border-top:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}th{width:170px;color:#3f7a62;font-weight:600}
+.note{font-size:12px;color:var(--muted);line-height:1.8}
+@media(max-width:640px){.drops{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><span class="mark">σ</span> midas 応力抽出 Excel <small>ファイルはこのブラウザー内で処理</small></header>
+<main>
+  <h1>節ごとの応力を、Excel にまとめる。</h1>
+  <p class="lead">midas Gen NX のモデル（MGT/MGTX）と解析結果（ANL）を読み込むと、計算書の節ごと（RC柱・RC梁・耐震壁・支点まわり・断面別／グループ別）に、チャートへ入れる値と全荷重ケースの応力、最大値のまとめを出力します。</p>
+
+  <section class="card">
+    <div class="drops">
+      <label class="drop" id="dropModel"><b>モデルファイル　<small style="color:#b16f58">必須</small></b><span>MGT / MGTX</span><div class="name" id="nameModel">クリックまたはドラッグ＆ドロップ</div><input id="fileModel" type="file" accept=".mgt,.mgtx,.txt"></label>
+      <label class="drop" id="dropAnl"><b>解析結果ファイル　<small style="color:#b16f58">必須</small></b><span>ANL（梁要素の断面力を出力したもの）</span><div class="name" id="nameAnl">クリックまたはドラッグ＆ドロップ</div><input id="fileAnl" type="file" accept=".anl,.txt,.out"></label>
+    </div>
+    <div class="opts">
+      <span>フェイス距離（0＝節点位置）</span>
+      <label>RC梁 <input id="faceBeam" type="number" value="0" min="0" step="10"> mm</label>
+      <label>RC柱 <input id="faceCol" type="number" value="0" min="0" step="10"> mm</label>
+    </div>
+    <div style="margin-top:18px;display:flex;gap:12px;align-items:center">
+      <button id="run" disabled>Excel を作る</button><span class="note" id="hint"></span>
+    </div>
+    <div id="status"><i></i><span>計算エンジンを準備しています…（初回は数十秒かかります）</span></div>
+    <div id="log"></div>
+  </section>
+
+  <section class="card">
+    <table>
+      <tr><th>4-1_RC柱 / 4-2_RC梁</th><td>チャートに入れる値（色付き）を、荷重ケースの組で並べた表。長期・短期・終局ごとに、曲げ最大・せん断最大などを 1 ケース選んでいる。「(詳細)」シートに全荷重ケースの応力と最大値のまとめ。</td></tr>
+      <tr><th>4-3_耐震壁</th><td>壁（板要素）の応力は ANL に出ていないため、板要素の一覧のみ。</td></tr>
+      <tr><th>4-4_支点まわり</th><td>支点節点に接する要素の端部力（柱脚・接合部の検討用）。</td></tr>
+      <tr><th>断面別・グループ別まとめ</th><td>鉄骨部材などの最大・最小と、その要素・点・ケース。</td></tr>
+    </table>
+    <p class="note" style="margin:12px 0 0">値は midas の要素座標系のまま（kN・kN·m）。荷重ケースの区分（長期／短期／終局）は、Excel の「概要」シートで変えられます。非公式ツールです。出力値は設計者が確認してください。</p>
+  </section>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const files = { model: null, anl: null };
+let ready = false, busy = false;
+
+function setStatus(msg, err = false) { $("#status").classList.toggle("err", err); $("#status span").textContent = msg; }
+function log(t) { const b = $("#log"); b.textContent += t + "\n"; b.scrollTop = b.scrollHeight; }
+function refresh() {
+  const ok = ready && !busy && files.model && files.anl;
+  $("#run").disabled = !ok;
+  $("#hint").textContent = ok ? "" : (ready ? "モデルと解析結果の両方を選んでください" : "");
+}
+
+const worker = new Worker("worker.js");
+worker.onerror = (e) => { setStatus("計算エンジンの起動に失敗しました", true); log("エラー: " + (e.message || "worker")); };
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === "ready") { ready = true; setStatus("準備ができました。ファイルを選んでください。"); refresh(); }
+  else if (m.type === "log") log(m.text);
+  else if (m.type === "done") {
+    busy = false; refresh();
+    const url = URL.createObjectURL(new Blob([m.bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    const a = Object.assign(document.createElement("a"), { href: url, download: m.filename });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setStatus("Excel を作成しました（" + m.filename + "）。");
+  } else if (m.type === "error") {
+    busy = false; refresh();
+    setStatus("失敗しました: " + (m.summary || "エラー"), true); log(m.text);
+  }
+};
+worker.postMessage({ type: "init" });
+
+function bind(kind, dropId, inputId, nameId) {
+  const drop = $(dropId), input = $(inputId);
+  const set = (f) => { if (!f) return; files[kind] = f; $(nameId).textContent = f.name + "（" + (f.size / 1048576).toFixed(1) + " MB）"; refresh(); };
+  input.addEventListener("change", () => set(input.files[0]));
+  ["dragenter", "dragover"].forEach((n) => drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.add("on"); }));
+  ["dragleave", "drop"].forEach((n) => drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.remove("on"); }));
+  drop.addEventListener("drop", (e) => set(e.dataTransfer.files[0]));
+}
+bind("model", "#dropModel", "#fileModel", "#nameModel");
+bind("anl", "#dropAnl", "#fileAnl", "#nameAnl");
+
+$("#run").addEventListener("click", async () => {
+  busy = true; refresh(); $("#log").textContent = "";
+  setStatus("読み込み・集計中…（ANL が大きいと数十秒かかります）");
+  const [model, anl] = await Promise.all([files.model.arrayBuffer(), files.anl.arrayBuffer()]);
+  const base = files.model.name.replace(/\.[^.]+$/, "");
+  worker.postMessage({
+    type: "convert", model, anl, modelName: files.model.name, anlName: files.anl.name,
+    faceBeam: Number($("#faceBeam").value) || 0, faceCol: Number($("#faceCol").value) || 0,
+    filename: base + "_応力抽出.xlsx",
+  }, [model, anl]);
+});
+</script>
+</body>
+</html>

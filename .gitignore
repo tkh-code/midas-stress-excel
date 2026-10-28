@@ -1,0 +1,5 @@
+_test/
+出力/
+__pycache__/
+*.xlsx
+start.bat
