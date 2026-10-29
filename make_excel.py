@@ -111,7 +111,134 @@ def read_mgt(path):
         p = [x.strip() for x in l.split(',')]
         if len(p) >= 2 and re.match(r'^[01]{6,7}$', p[1]):
             supports.update(expand_ids(p[0]))
-    return dict(nodes=nodes, elements=elements, sections=sections, thickness=thickness, groups=groups, supports=supports)
+    return dict(nodes=nodes, elements=elements, sections=sections, thickness=thickness, groups=groups, supports=supports,
+                grids=read_grids(secs, length_to_mm))
+
+
+# ───────────────────────── 通り芯（midas の寸法線・テキスト） ─────────────────────────
+
+def dimension_point(view, pt):
+    rx, ry, rz = (math.radians(a) for a in view['rotation'])
+    x, y, z = (v * view['scale'] for v in pt)
+    y1, z1 = y * math.cos(rx) - z * math.sin(rx), y * math.sin(rx) + z * math.cos(rx)
+    x2, z2 = x * math.cos(ry) + z1 * math.sin(ry), -x * math.sin(ry) + z1 * math.cos(ry)
+    x3, y3 = x2 * math.cos(rz) - y1 * math.sin(rz), x2 * math.sin(rz) + y1 * math.cos(rz)
+    return (x3 + view['origin'][0], y3 + view['origin'][1], z2 + view['origin'][2])
+
+
+def read_grids(secs, length_to_mm):
+    """*DIMENSION（原点）と *DIMENSION-LINETEXT（線・文字）から、X 系・Y 系の通り芯を作る。
+
+    符号は文字に一番近い線の端に付ける。名前が X／BX で始まれば X 系、Y／BY なら Y 系。
+    """
+    views = {}
+    for l in secs.get('DIMENSION', []):
+        p = [x.strip() for x in l.split(',')]
+        if len(p) >= 8 and p[0] and not p[0].startswith(';'):
+            try:
+                v = [float(x) for x in p[1:8]]
+            except ValueError:
+                continue
+            views[p[0]] = dict(name=p[0], scale=v[0], origin=tuple(c * length_to_mm for c in v[1:4]), rotation=v[4:7], lines=[], texts=[])
+    for l in secs.get('DIMENSION-LINETEXT', []):
+        p = [x.strip() for x in l.split(',')]
+        if len(p) < 11 or p[0] not in views:
+            continue
+        try:
+            kind = int(p[1])
+            co = [float(x) * length_to_mm for x in p[5:11]]
+        except ValueError:
+            continue
+        view = views[p[0]]
+        a, b = dimension_point(view, co[:3]), dimension_point(view, co[3:])
+        if kind == 0:
+            view['lines'].append((a, b))
+        elif kind == 1 and p[2]:
+            view['texts'].append((p[2], a))
+    grids = []
+    for view in views.values():
+        named = []
+        for name, at in view['texts']:
+            best = None
+            for line in view['lines']:
+                for end in (0, 1):
+                    d = math.hypot(line[end][0] - at[0], line[end][1] - at[1])
+                    if best is None or d < best[0]:
+                        best = (d, line)
+            if best and best[0] < 5000:
+                named.append((name, best[1]))
+        for name, line in named:
+            m = re.match(r'^B?([XY])', name)
+            if m and math.hypot(line[1][0] - line[0][0], line[1][1] - line[0][1]) > 1:
+                grids.append(dict(view=view['name'], name=name, family=m.group(1), p0=line[0][:2], p1=line[1][:2], z=view['origin'][2]))
+    return grids
+
+
+class GridIndex:
+    """平面上の点が、どの通りの上・どの通りの間にあるかを文字にする。"""
+
+    def __init__(self, grids, tol=100.0):
+        self.tol = tol
+        self.views = collections.OrderedDict()
+        for g in grids:
+            self.views.setdefault(g['view'], dict(z=g['z'], fam={}))['fam'].setdefault(g['family'], []).append(g)
+        for v in self.views.values():
+            for fam, lines in v['fam'].items():
+                ref = None
+                for g in lines:
+                    d = (g['p1'][0] - g['p0'][0], g['p1'][1] - g['p0'][1])
+                    ref = ref or d
+                    if d[0] * ref[0] + d[1] * ref[1] < 0:
+                        g['p0'], g['p1'] = g['p1'], g['p0']
+                        d = (-d[0], -d[1])
+                    length = math.hypot(*d)
+                    g['n'] = (-d[1] / length, d[0] / length)
+                # 並び順の基準：全体の中心から見た符号付き距離
+                cx = sum(g['p0'][0] + g['p1'][0] for g in lines) / (2 * len(lines))
+                cy = sum(g['p0'][1] + g['p1'][1] for g in lines) / (2 * len(lines))
+                for g in lines:
+                    g['c'] = g['n'][0] * (cx - g['p0'][0]) + g['n'][1] * (cy - g['p0'][1])
+                lines.sort(key=lambda g: g['c'])
+
+    @property
+    def available(self):
+        return bool(self.views)
+
+    def view_for(self, ref_z):
+        return min(self.views.values(), key=lambda v: abs(v['z'] - ref_z)) if self.views else None
+
+    def _family(self, lines, pt):
+        sd = [g['n'][0] * (pt[0] - g['p0'][0]) + g['n'][1] * (pt[1] - g['p0'][1]) for g in lines]
+        k = min(range(len(lines)), key=lambda i: abs(sd[i]))
+        if abs(sd[k]) <= self.tol:
+            return f'{lines[k]["name"]}上'
+        # 並び順（c の昇順）で、点がまだ手前側にある通り（符号付き距離 < 0）は先頭からの連続。
+        passed = [i for i in range(len(lines)) if sd[i] < 0]
+        if not passed:
+            return f'{lines[0]["name"]}外'
+        i = passed[-1]
+        return f'{lines[i]["name"]}外' if i == len(lines) - 1 else f'{lines[i]["name"]}〜{lines[i + 1]["name"]}'
+
+    def label(self, pt, ref_z):
+        """pt: 全体座標の点、ref_z: 通りの面を選ぶための高さ（部材の最低点）。"""
+        view = self.view_for(ref_z)
+        if not view:
+            return ''
+        parts = [self._family(view['fam'][f], pt) for f in ('X', 'Y') if f in view['fam']]
+        return ' × '.join(parts)
+
+
+def point_on_element(model, element, pt):
+    nodes = model['nodes']
+    a, b = nodes[element['nodes'][0]], nodes[element['nodes'][1]]
+    t = {'I': 0.0, '1/4': 0.25, 'CNT': 0.5, '3/4': 0.75, 'J': 1.0}[pt]
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def element_grid(model, gi, eid, pt):
+    e = model['elements'][eid]
+    ref_z = min(model['nodes'][n][2] for n in e['nodes'][:2])
+    return gi.label(point_on_element(model, e, pt), ref_z)
 
 
 # ───────────────────────── ANL ─────────────────────────
@@ -216,6 +343,22 @@ class Line:
                 out.append((s0 + L * k / 4, pts[p][ci]))
             s0 += L
         return out
+
+    def point_at(self, model, s):
+        """部材の始端から距離 s の点（全体座標）。"""
+        nodes = model['nodes']
+        s = max(0.0, min(self.total, s))
+        s0 = 0.0
+        for e, L in zip(self.elems, self.lengths):
+            if s <= s0 + L + 1e-9:
+                a, b = nodes[e['nodes'][0]], nodes[e['nodes'][1]]
+                t = (s - s0) / L if L else 0.0
+                return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+            s0 += L
+        return nodes[self.elems[-1]['nodes'][1]]
+
+    def min_z(self, model):
+        return min(model['nodes'][n][2] for e in self.elems for n in e['nodes'][:2])
 
     def value_at(self, results, case, ci, s):
         st = self.stations(results, case, ci)
@@ -352,7 +495,7 @@ def write_case_table(ws, top, info_heads, rows, cases, class_cells):
                 if j != c_sum - 1 + 3:
                     c.number_format = '0.0'
     for j in range(len(info_heads)):
-        ws.column_dimensions[get_column_letter(1 + j)].width = 44 if j == 0 else 22
+        ws.column_dimensions[get_column_letter(1 + j)].width = 44 if j == 0 else 22 if j == 1 else 24
     ws.column_dimensions[get_column_letter(c_comp)].width = 12
     ws.column_dimensions[get_column_letter(c_unit)].width = 7
     for j in range(len(sums)):
@@ -368,7 +511,7 @@ def case_values(results, eid, pt, ci, cases):
     return [results.get(eid, {}).get(c, {}).get(pt, [None] * 6)[ci] for c in cases]
 
 
-def sheet_columns(ws, model, res, cases, class_cells, columns, face):
+def sheet_columns(ws, model, res, cases, class_cells, columns, face, gi):
     top = title(ws, '4-1 RC柱の設計　設計用応力（midas 梁要素の断面力）', [
         f'対象：RC柱 {len(columns)} 本（断面名が「RC」で始まり、ほぼ鉛直の要素）。値は midas の要素座標系のまま（単位 kN・kN·m、ANL: {res["units"]}）。',
         '柱頭＝上側の節点、柱脚＝下側の節点。フェイス距離を指定した場合は、その距離だけ内側の値を要素の5点から線形補間する。',
@@ -384,15 +527,17 @@ def sheet_columns(ws, model, res, cases, class_cells, columns, face):
         for lab, s, nd in (('柱頭', 0 if top_is_i else L, a if top_is_i else b), ('柱中央', L / 2, None), ('柱脚', L if top_is_i else 0, b if top_is_i else a)):
             if lab != '柱中央' and face:
                 s = s + face if s == 0 else s - face
-            info = [f'RC柱 要素{e["id"]}（{model["sections"].get(e["sec"], "")}） L={L / 1000:.2f}m', f'{lab}' + (f'（節点{nd}）' if nd else '')]
-            groups.append((info[0], info[1], len(rows)))
+            pt3 = model['nodes'][nd] if nd else line.point_at(model, L / 2)
+            info = [f'RC柱 要素{e["id"]}（{model["sections"].get(e["sec"], "")}） L={L / 1000:.2f}m', f'{lab}' + (f'（節点{nd}）' if nd else ''),
+                    gi.label(pt3, line.min_z(model))]
+            groups.append((info[0], info[1], info[2], len(rows)))
             for ci, comp in enumerate(COMPS):
                 rows.append((info, comp, [line.value_at(res['results'], c, ci, s) for c in cases]))
-    meta = write_case_table(ws, top, ['部材', '位置'], rows, cases, class_cells)
-    return meta, [(a, b, meta['first'] + k) for a, b, k in groups]
+    meta = write_case_table(ws, top, ['部材', '位置', '通り'], rows, cases, class_cells)
+    return meta, [(a, b, g, meta['first'] + k) for a, b, g, k in groups]
 
 
-def sheet_beams(ws, model, res, cases, class_cells, chains, face):
+def sheet_beams(ws, model, res, cases, class_cells, chains, face, gi):
     top = title(ws, '4-2 RC梁（基礎梁）の設計　設計用応力（midas 梁要素の断面力）', [
         f'対象：RC梁 {len(chains)} 部材（断面名が「RC」で始まる水平な要素。他の梁・支点に接しない節点でつながる要素は 1 部材にまとめた）。',
         f'値は midas の要素座標系のまま（単位 kN・kN·m、ANL: {res["units"]}）。左端・右端＝部材の始端・終端、中央＝部材長の中点（要素の5点から線形補間）。',
@@ -404,12 +549,14 @@ def sheet_beams(ws, model, res, cases, class_cells, chains, face):
         d = min(face, L / 2 - 1) if face else 0
         n0, n1 = line.node_ids[0], line.node_ids[-1]
         for lab, s, nd in (('左端', d, n0), ('中央', L / 2, None), ('右端', L - d, n1)):
-            info = [f'RC梁 B{k:02d}　要素{id_range(line.elems)}　L={L / 1000:.2f}m', lab + (f'（節点{nd}）' if nd else '')]
-            groups.append((info[0], info[1], len(rows)))
+            pt3 = model['nodes'][nd] if nd else line.point_at(model, L / 2)
+            info = [f'RC梁 B{k:02d}　要素{id_range(line.elems)}　L={L / 1000:.2f}m', lab + (f'（節点{nd}）' if nd else ''),
+                    gi.label(pt3, line.min_z(model))]
+            groups.append((info[0], info[1], info[2], len(rows)))
             for ci, comp in enumerate(COMPS):
                 rows.append((info, comp, [line.value_at(res['results'], c, ci, s) for c in cases]))
-    meta = write_case_table(ws, top, ['部材', '位置'], rows, cases, class_cells)
-    return meta, [(a, b, meta['first'] + k) for a, b, k in groups]
+    meta = write_case_table(ws, top, ['部材', '位置', '通り'], rows, cases, class_cells)
+    return meta, [(a, b, g, meta['first'] + k) for a, b, g, k in groups]
 
 
 BEAM_PICKS = [
@@ -440,14 +587,14 @@ def sheet_chart(ws, heading, notes, detail_name, meta, groups, picks, chart_comp
     cls_rng = f"{q}!${cc}${meta['cls_row']}:${lc}${meta['cls_row']}"
     name_rng = f"{q}!${cc}${meta['head_row']}:${lc}${meta['head_row']}"
     sc = lambda off: get_column_letter(meta['c_sum'] + off)   # 0 長期 / 1 短期最大 / 2 短期最小 / 4 終局最大 / 5 終局最小
-    heads = ['部材', '位置', '区分', '選定の基準', '荷重ケース'] + [f'{c}\n({COMP_UNIT[c]})' for c in COMPS] + ['ケース番号']
+    heads = ['部材', '位置', '通り', '区分', '選定の基準', '荷重ケース'] + [f'{c}\n({COMP_UNIT[c]})' for c in COMPS] + ['ケース番号']
     for j, h in enumerate(heads):
         c = ws.cell(top, 1 + j, h)
         c.font, c.fill, c.border = BOLD, HEAD, BORDER
         c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
     ws.row_dimensions[top].height = 34
     r = top + 1
-    for gi, (mem, pos, r0) in enumerate(groups):
+    for gi, (mem, pos, grid, r0) in enumerate(groups):
         for cls, label, drive, mode in picks:
             row_of = lambda comp: r0 + COMPS.index(comp)
             drv = row_of(drive)
@@ -458,33 +605,57 @@ def sheet_chart(ws, heading, notes, detail_name, meta, groups, picks, chart_comp
                 mx, mn = (f"{q}!{sc(1 if cls == '短期' else 4)}{drv}", f"{q}!{sc(2 if cls == '短期' else 5)}{drv}")
                 val = mx if mode == 'max' else mn if mode == 'min' else f'IF({mx}>=-{mn},{mx},{mn})'
                 k = f'=IFERROR(MATCH(1,INDEX(({cls_rng}="{cls}")*({rng}={val}),0),0),"")'
-            cells = [mem, pos, cls, label, f'=IF($L{r}="","",INDEX({name_rng},$L{r}))']
+            cells = [mem, pos, grid, cls, label, f'=IF($M{r}="","",INDEX({name_rng},$M{r}))']
             for comp in COMPS:
                 rr = row_of(comp)
-                cells.append(f'=IF($L{r}="","",INDEX({q}!${cc}{rr}:${lc}{rr},$L{r}))')
+                cells.append(f'=IF($M{r}="","",INDEX({q}!${cc}{rr}:${lc}{rr},$M{r}))')
             cells.append(k)
             for j, v in enumerate(cells):
                 c = ws.cell(r, 1 + j, v)
                 c.border = BORDER
-                if 5 <= j <= 10:
+                if 6 <= j <= 11:
                     c.number_format = '0.0'
-                    comp = COMPS[j - 5]
+                    comp = COMPS[j - 6]
                     if comp in chart_comps:
                         c.fill = SUMF
                         c.font = BOLD
                     else:
                         c.font = Font(color='999999')
-                if j == 11:
+                if j == 12:
                     c.font = Font(color='999999', size=8)
-                if cls == '長期' and j < 5:
+                if cls == '長期' and j < 6:
                     c.fill = PatternFill('solid', fgColor=CLASS_COLOR['長期'])
-                elif j == 2:
+                elif j == 3:
                     c.fill = PatternFill('solid', fgColor=CLASS_COLOR[cls])
             r += 1
-    for j, w in enumerate((44, 24, 7, 30, 18, 10, 10, 10, 10, 10, 10, 8)):
+    for j, w in enumerate((44, 22, 24, 7, 30, 18, 10, 10, 10, 10, 10, 10, 8)):
         ws.column_dimensions[get_column_letter(1 + j)].width = w
-    ws.freeze_panes = ws.cell(top + 1, 6)
-    ws.auto_filter.ref = f'A{top}:L{max(r - 1, top)}'
+    ws.freeze_panes = ws.cell(top + 1, 7)
+    ws.auto_filter.ref = f'A{top}:M{max(r - 1, top)}'
+
+
+def sheet_grids(ws, model, gi):
+    top = title(ws, '通り芯（midas の寸法線・テキストから読み取り）', [
+        '各シートの「通り」列は、この通り芯からの位置。「X3上」＝通りから 100 mm 以内、「X3〜X4」＝その間、「X5外」＝端の通りの外側。',
+        '面の選び方：RC部材・支点まわりは、部材の最低点の高さに一番近い寸法ビュー（基礎レベルの BX・BY）、鉄骨は屋根レベルの X・Y を使う。座標は m（midas の全体座標）。',
+    ])
+    for j, h in enumerate(['寸法ビュー', '符号', '系', '始点 X', '始点 Y', '終点 X', '終点 Y', '高さ Z', '角度(°)']):
+        c = ws.cell(top, 1 + j, h)
+        c.font, c.fill, c.border = BOLD, HEAD, BORDER
+    r = top + 1
+    for v in gi.views.values():
+        for fam in ('X', 'Y'):
+            for g in v['fam'].get(fam, []):
+                ang = math.degrees(math.atan2(g['p1'][1] - g['p0'][1], g['p1'][0] - g['p0'][0]))
+                vals = [g['view'], g['name'], fam, g['p0'][0] / 1000, g['p0'][1] / 1000, g['p1'][0] / 1000, g['p1'][1] / 1000, g['z'] / 1000, ang]
+                for j, x in enumerate(vals):
+                    c = ws.cell(r, 1 + j, round(x, 4) if isinstance(x, float) else x)
+                    c.border = BORDER
+                    if isinstance(x, float):
+                        c.number_format = '0.000'
+                r += 1
+    for j, w in enumerate((14, 8, 5, 12, 12, 12, 12, 9, 9)):
+        ws.column_dimensions[get_column_letter(1 + j)].width = w
 
 
 def sheet_walls(ws, model):
@@ -509,7 +680,7 @@ def sheet_walls(ws, model):
         ws.column_dimensions[col].width = w
 
 
-def sheet_supports(ws, model, res, cases, class_cells):
+def sheet_supports(ws, model, res, cases, class_cells, gi):
     results = res['results']
     top = title(ws, '4-4 柱脚・支点まわり　支点節点に接する要素の端部力', [
         f'支点（拘束）節点に接する梁要素について、支点側の端部の断面力を並べた。柱脚・アンカー・接合部の検討に使う（単位 kN・kN·m、ANL: {res["units"]}）。',
@@ -521,10 +692,10 @@ def sheet_supports(ws, model, res, cases, class_cells):
             if e['type'] != 'BEAM' or n not in e['nodes'][:2]:
                 continue
             end = 'I' if e['nodes'][0] == n else 'J'
-            info = [f'節点 {n}　要素{e["id"]}（{model["sections"].get(e["sec"], "")}）', f'{end}端']
+            info = [f'節点 {n}　要素{e["id"]}（{model["sections"].get(e["sec"], "")}）', f'{end}端', gi.label(model['nodes'][n], model['nodes'][n][2])]
             for ci, comp in enumerate(COMPS):
                 rows.append((info, comp, case_values(results, e['id'], end, ci, cases)))
-    write_case_table(ws, top, ['支点節点・要素（断面）', '位置'], rows, cases, class_cells)
+    write_case_table(ws, top, ['支点節点・要素（断面）', '位置', '通り'], rows, cases, class_cells)
 
 
 def extremes(elem_ids, results, classes):
@@ -545,8 +716,8 @@ def extremes(elem_ids, results, classes):
     return best
 
 
-def sheet_summary(ws, heading, note, groups, model, res, classes):
-    top = title(ws, heading, [note, f'単位 kN・kN·m（ANL: {res["units"]}）。区分は生成時の仮決め（長期＝NΣDL、短期＝SL・SLU・WZ・EX・EY、終局＝（終局））。位置は「要素 点 ケース」。'])
+def sheet_summary(ws, heading, note, groups, model, res, classes, gi):
+    top = title(ws, heading, [note, f'単位 kN・kN·m（ANL: {res["units"]}）。区分は生成時の仮決め（長期＝NΣDL、短期＝SL・SLU・WZ・EX・EY、終局＝（終局））。位置は「要素 点　通り　ケース」。'])
     heads = ['名称', '要素数', '成分', '単位', '長期 絶対最大', '長期 位置', '短期 最大', '短期 位置', '短期 最小', '短期 位置', '終局 最大', '終局 位置', '終局 最小', '終局 位置']
     for j, h in enumerate(heads):
         c = ws.cell(top, 1 + j, h)
@@ -563,7 +734,10 @@ def sheet_summary(ws, heading, note, groups, model, res, classes):
         for ci, comp in enumerate(COMPS):
             def pick(cls, kind):
                 v = best.get((ci, cls, kind))
-                return (round(v[0], 3), f'{v[1]} {v[2]} {v[3]}') if v else (None, '')
+                if not v:
+                    return (None, '')
+                grid = element_grid(model, gi, v[1], v[2]) if gi.available else ''
+                return (round(v[0], 3), f'{v[1]} {v[2]}　{grid}　{v[3]}' if grid else f'{v[1]} {v[2]}　{v[3]}')
             lo, hi = pick('長期', 'max'), pick('長期', 'min')
             long_abs = lo if lo[0] is not None and (hi[0] is None or lo[0] >= -hi[0]) else hi
             cells = [name if ci == 0 else '', len(ids) if ci == 0 else '', COMP_NAME[comp], COMP_UNIT[comp],
@@ -576,7 +750,7 @@ def sheet_summary(ws, heading, note, groups, model, res, classes):
                 if j in (4, 6, 8, 10, 12):
                     c.number_format = '0.0'
             r += 1
-    for j, w in enumerate((30, 8, 12, 7, 12, 26, 12, 26, 12, 26, 12, 26, 12, 26)):
+    for j, w in enumerate((30, 8, 12, 7, 12, 44, 12, 44, 12, 44, 12, 44, 12, 44)):
         ws.column_dimensions[get_column_letter(1 + j)].width = w
     ws.freeze_panes = ws.cell(top + 1, 4)
     ws.auto_filter.ref = f'A{top}:N{max(r - 1, top)}'
@@ -618,6 +792,7 @@ def sheet_overview(ws, model_path, anl_path, model, res, cases, classes, n_col, 
              ('4-2_RC梁(詳細)', 'RC梁の全荷重ケースの応力と、長期／短期／終局のまとめ（数式）'),
              ('4-3_耐震壁', '壁（板要素）の応力は ANL に無いため一覧のみ'),
              ('4-4_支点まわり', '支点節点に接する要素の端部力（柱脚・接合部の検討用）'),
+             ('通り芯', '「通り」列の判定に使った、midas の通り芯の一覧'),
              ('断面別まとめ', '断面ごとの最大・最小（長期／短期／終局）と、その要素・点・ケース。鉄骨部材の検定用'),
              ('グループ別まとめ', 'midas のグループ（トラス・つなぎ・キール・リング）ごとの最大・最小')]
     for i, (k, v) in enumerate(guide):
@@ -665,9 +840,11 @@ def build(model_path, anl_path, out_path, face_beam=0.0, face_col=0.0, log=say, 
     wb = Workbook()
     ws0 = wb.active
     ws0.title = '概要'
+    gi = GridIndex(model['grids'])
+    log(f'  通り芯 {len(model["grids"])} 本（寸法ビュー：{", ".join(gi.views) or "なし"}）')
     refs = sheet_overview(ws0, model_label or model_path, anl_label or anl_path, model, res, cases, classes, len(columns), len(chains), face_beam, face_col)
     ws_c1 = wb.create_sheet('4-1_RC柱')
-    meta, groups = sheet_columns(wb.create_sheet('4-1_RC柱(詳細)'), model, res, cases, refs, columns, face_col)
+    meta, groups = sheet_columns(wb.create_sheet('4-1_RC柱(詳細)'), model, res, cases, refs, columns, face_col, gi)
     sheet_chart(ws_c1, '4-1 RC柱　チャートに入れる設計用応力', [
         '色付きのセルがチャート（軸力＋曲げ／せん断）に入れる値。同じ行は同じ荷重ケースの組なので、N・My・Mz はそのまま組で使う。',
         '位置は柱頭・柱脚（RC部材の検定位置）。短期・終局は、選定の基準（曲げ最大・せん断最大・圧縮最大・引張最大）ごとに 1 ケースを選んでいる。',
@@ -675,7 +852,7 @@ def build(model_path, anl_path, out_path, face_beam=0.0, face_col=0.0, log=say, 
         '短期の各ケースは、すでに長期荷重を含む組合せ（NΣDL＋…）なので、長期との和は取らない。T は参考。全ケースの値は「4-1_RC柱(詳細)」。',
     ], '4-1_RC柱(詳細)', meta, groups, COLUMN_PICKS, {'N', 'Qy', 'Qz', 'My', 'Mz'})
     ws_b1 = wb.create_sheet('4-2_RC梁')
-    meta, groups = sheet_beams(wb.create_sheet('4-2_RC梁(詳細)'), model, res, cases, refs, chains, face_beam)
+    meta, groups = sheet_beams(wb.create_sheet('4-2_RC梁(詳細)'), model, res, cases, refs, chains, face_beam, gi)
     sheet_chart(ws_b1, '4-2 RC梁（基礎梁）　チャートに入れる設計用応力', [
         '色付きのセルがチャート（曲げ・せん断）に入れる値。曲げ：下端筋は My が＋の最大、上端筋は My が−の最大（絶対値）。せん断：Qz の絶対最大。',
         '位置は左端・中央・右端。midas の My は、スパン中央で＋（下端引張）、端部で−（上端引張）になる符号。N・T・Mz・Qy は参考（灰色）。',
@@ -683,7 +860,7 @@ def build(model_path, anl_path, out_path, face_beam=0.0, face_col=0.0, log=say, 
         '全ケースの値と、長期／短期／終局のまとめは「4-2_RC梁(詳細)」。',
     ], '4-2_RC梁(詳細)', meta, groups, BEAM_PICKS, {'My', 'Qz'})
     sheet_walls(wb.create_sheet('4-3_耐震壁'), model)
-    sheet_supports(wb.create_sheet('4-4_支点まわり'), model, res, cases, refs)
+    sheet_supports(wb.create_sheet('4-4_支点まわり'), model, res, cases, refs, gi)
 
     by_sec = collections.OrderedDict()
     for e in sorted(model['elements'].values(), key=lambda x: x['id']):
@@ -691,10 +868,12 @@ def build(model_path, anl_path, out_path, face_beam=0.0, face_col=0.0, log=say, 
             by_sec.setdefault(e['sec'], []).append(e['id'])
     sec_groups = [(f'{s}  {model["sections"].get(s, "")}', ids) for s, ids in sorted(by_sec.items())]
     sheet_summary(wb.create_sheet('断面別まとめ'), '断面ごとの最大・最小応力（全梁要素）',
-                  '各断面の全要素・全点・全荷重ケースの中での最大・最小。トラス・つなぎ・キール・リング各部材の検定に使う。', sec_groups, model, res, classes)
+                  '各断面の全要素・全点・全荷重ケースの中での最大・最小。トラス・つなぎ・キール・リング各部材の検定に使う。', sec_groups, model, res, classes, gi)
     grp = [(n, ids) for n, ids in model['groups'].items() if ids and not n.startswith('膜')]
     sheet_summary(wb.create_sheet('グループ別まとめ'), 'midas グループごとの最大・最小応力',
-                  'グループ（トラス_X1〜X5、つなぎ_Ya〜Yn、キール、リング）に入っている要素の中での最大・最小。', grp, model, res, classes)
+                  'グループ（トラス_X1〜X5、つなぎ_Ya〜Yn、キール、リング）に入っている要素の中での最大・最小。', grp, model, res, classes, gi)
+    if gi.available:
+        sheet_grids(wb.create_sheet('通り芯'), model, gi)
     wb.save(out_path)
     log(f'保存しました：{out_path}')
 
